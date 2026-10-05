@@ -22,7 +22,7 @@ import {
   setCustomSpeed,
 } from './profile.js'
 import {
-  BONUS_PAD_MIN_WINS,
+  BONUS_PAD_MIN_REBIRTHS,
   DEV_TOOLS,
   LOBBY,
   LOBBY_SPAWN,
@@ -37,6 +37,8 @@ import {
   TREADMILLS,
   TREADMILL_STEPS_PER_SEC,
   WALK_TO_WORLD,
+  newExpedition, expeditionAction, excavationComplete, blockedExcavation, stageAccess, stageStartZ,
+  canPush, stageCenterX,
   allStages,
   chairById,
   inPad,
@@ -44,7 +46,6 @@ import {
   onTreadmill,
   regionAtZ,
   speedMultiplier,
-  stageEndZ,
   stageSpawn,
 } from './shared/gameData.js'
 
@@ -82,6 +83,25 @@ export class LobbyRoom extends Room {
         }
       })
 
+    on('expedition', (p, m) => {
+      const error = expeditionAction(p.expedition, p.pos, m.action, m.id)
+      if (error) return this.error(p, error)
+      p.client.send('expedition', p.expedition)
+    })
+    on('push', (p, m) => {
+      const target = this.players.get(String(m.sid))
+      const now = Date.now()
+      if (!canPush(p, target, now)) return this.error(p, 'Move within 3m of a player on the course. Push cooldown: 3s.')
+      const dx = target.pos.x - p.pos.x, dz = target.pos.z - p.pos.z
+      const distance = Math.hypot(dx, dz)
+      const x = distance > 0.05 ? dx / distance : Math.sin(p.pos.yaw)
+      const z = distance > 0.05 ? dz / distance : Math.cos(p.pos.yaw)
+      p.pushReadyAt = now + 3000
+      target.pushImmuneUntil = now + 1500
+      target.budget += 9
+      target.client.send('push', { x: x * 12, z: z * 12, up: 3.5, duration: 0.65 })
+      p.client.send('pushReady', { at: p.pushReadyAt })
+    })
     on('pos', (p, m) => this.onPos(p, m))
     on('ping', (p, m) => p.client.send('pong', { t: m.t, now: Date.now() }))
     on('respawn', (p) => this.respawn(p))
@@ -168,6 +188,7 @@ export class LobbyRoom extends Room {
       distAcc: 0,
       pendingGain: 0,
       pendingSrc: 'step',
+      expedition: newExpedition(),
       run: { stage: 0, enteredAt: 0, gates: new Set() },
       dirty: true,
       lastSave: Date.now(),
@@ -177,6 +198,7 @@ export class LobbyRoom extends Room {
     activeSessions.set(auth.uid, { room: this, client })
 
     client.send('init', {
+      expedition: p.expedition,
       sid: client.sessionId,
       roomId: this.roomId,
       now: Date.now(),
@@ -282,6 +304,10 @@ export class LobbyRoom extends Room {
 
   setPos(p, spawn) {
     p.pos = { x: spawn.x, y: spawn.y, z: spawn.z, yaw: spawn.yaw ?? Math.PI }
+    if (regionAtZ(spawn.z).stage === 0) {
+      p.expedition = newExpedition()
+      p.client.send('expedition', p.expedition)
+    }
     p.budget = 6
     p.lastPosAt = Date.now()
     p.client.send('teleport', p.pos)
@@ -311,6 +337,13 @@ export class LobbyRoom extends Room {
     }
     p.budget -= dist
 
+    const destination = regionAtZ(z)
+    const denied = destination.inCourse && p.expedition.devStage !== destination.stage && stageAccess(p.profile, destination.stage)
+    if (denied) {
+      this.error(p, denied)
+      return this.setPos(p, { x: stageCenterX(destination.stage), y: 1.5, z: stageStartZ(destination.stage) + 4, yaw: Math.PI })
+    }
+    if (blockedExcavation(p.expedition, { x, y, z })) return this.setPos(p, p.pos)
     p.pos = { x, y, z, yaw }
     p.flags = flags | 0
 
@@ -400,11 +433,10 @@ export class LobbyRoom extends Room {
   /* ---------------------------------------------------------------- */
 
   respawn(p) {
-    const region = regionAtZ(p.pos.z)
-    if (region.stage === 0) return this.setPos(p, LOBBY_SPAWN)
-    // Dying in a safe room (the bonus lava) keeps you in that safe room.
-    if (region.inSafe) return this.setPos(p, { x: 0, y: 1.5, z: stageEndZ(region.stage) - 3, yaw: Math.PI })
-    this.setPos(p, stageSpawn(region.stage))
+    // A death in any adventure sends the player back to the lobby. This keeps
+    // failed runs from restarting inside a stage or its safe-room checkpoint.
+    p.run = { stage: 0, enteredAt: 0, gates: new Set() }
+    this.setPos(p, LOBBY_SPAWN)
   }
 
   teleport(p, stage) {
@@ -414,15 +446,21 @@ export class LobbyRoom extends Room {
     }
     if (stage > STAGE_COUNT) return
     if (stage > p.profile.maxStage) return this.error(p, `Reach stage ${stage} first!`)
+    const denied = stageAccess(p.profile, stage)
+    if (denied) return this.error(p, denied)
+    p.expedition.devStage = 0
+    p.client.send('expedition', p.expedition)
     const cost = STAGES[stage].tp
     if (p.profile.wins < cost) return this.error(p, 'Not enough wins!')
     p.profile.wins -= cost
     this.changed(p)
     p.client.send('sfx', { name: 'teleport' })
-    this.setPos(p, stageSpawn(stage))
+    const rack = this.stages[stage - 1]?.toolRack
+    this.setPos(p, rack && !p.expedition.tool ? { x: rack.x, y: 1.5, z: rack.z + 2, yaw: Math.PI } : stageSpawn(stage))
   }
 
   claimGate(p, stage, idx) {
+    if (!excavationComplete(p.expedition, stage) || (p.expedition.devStage !== stage && stageAccess(p.profile, stage))) return
     if (p.run.stage !== stage || p.run.gates.has(idx)) return
     const gate = this.stages[stage]?.gates[idx]
     if (!gate) return
@@ -434,17 +472,18 @@ export class LobbyRoom extends Room {
   }
 
   claimReturn(p, stage, bonus) {
+    if (!excavationComplete(p.expedition, stage)) return this.error(p, 'Complete the stage excavation first.')
+    if (p.expedition.devStage !== stage && stageAccess(p.profile, stage)) return this.error(p, 'This stage is locked.')
     const st = this.stages[stage]
-    if (!st || p.run.stage !== stage || p.run.claimed) return
+    // The server position and safe-room check below are authoritative. Do not make
+    // claiming depend on the best-effort run-stage tracker: a player can legitimately
+    // reach the safe room while that transient flag is still 0 after a reconnect.
+    if (!st || p.run.claimed) return this.error(p, 'This wins pad is not ready yet.')
     const region = regionAtZ(p.pos.z)
-    if (region.stage !== stage || !region.inSafe) return
+    if (region.stage !== stage || !region.inSafe) return this.error(p, 'Move onto the safe-room wins pad.')
     const pad = bonus ? st.bonusPad : st.returnPad
-    if (!inPad(pad, p.pos.x, p.pos.z, 1.5)) return
-    if (bonus && p.profile.wins < BONUS_PAD_MIN_WINS) return this.error(p, `Need ${BONUS_PAD_MIN_WINS} wins to unlock this pad!`)
-    // You can't have crossed the course faster than your max speed allows.
-    const minTime = (st.len / (maxWalkSpeed(p.profile) * WALK_TO_WORLD)) * 650
-    if (Date.now() - p.run.enteredAt < minTime) return
-
+    if (!inPad(pad, p.pos.x, p.pos.z, 1.5)) return this.error(p, 'Stand on the wins pad and press E.')
+    if (bonus && p.profile.rebirths < BONUS_PAD_MIN_REBIRTHS) return this.error(p, `Need ${BONUS_PAD_MIN_REBIRTHS} rebirths to unlock this pad!`)
     p.run.claimed = true
     const wins = Math.round(pad.wins * (1 + p.profile.rebirths * REBIRTH_WIN_BONUS))
     p.profile.wins += wins
@@ -461,7 +500,11 @@ export class LobbyRoom extends Room {
     const prof = p.profile
     switch (m.action) {
       case 'tp': {
-        const s = Math.max(0, Math.min(STAGE_COUNT, Number(m.stage) || 0))
+        const s = Math.max(0, Math.min(STAGE_COUNT, Math.floor(Number(m.stage) || 0)))
+        p.expedition = newExpedition(s)
+        if (this.stages[s]?.digSites.length) p.expedition.tool = 'pickaxe'
+        p.client.send('expedition', p.expedition)
+        p.run = { stage: 0, enteredAt: 0, gates: new Set() }
         if (s > prof.maxStage) prof.maxStage = s
         this.setPos(p, s === 0 ? LOBBY_SPAWN : stageSpawn(s))
         break
