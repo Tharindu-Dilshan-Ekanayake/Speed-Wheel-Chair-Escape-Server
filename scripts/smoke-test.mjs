@@ -78,8 +78,41 @@ a.send('pos', [0, 1.5, -2000, 0, 3])
 await wait(200)
 check(la.teleport.length >= 2, 'impossible jump is corrected by the server')
 
+// Every atlas card must select its own region, and carry state must reach peers.
+const { regionAtZ, STAGE_COUNT } = await import('../src/shared/gameData.js')
+for (let stage = 1; stage <= STAGE_COUNT; stage += 1) {
+  a.send('dev', { action: 'tp', stage })
+  await wait(120)
+  const spawn = la.teleport.at(-1)
+  check(regionAtZ(spawn.z).stage === stage, `Stage Lab selects stage ${stage}`)
+  a.send('pos', [spawn.x, spawn.y, spawn.z, spawn.yaw, 11])
+  await wait(120)
+}
+check(lb.snap.some((snap) => snap.some((p) => p[0] === a.sessionId && (p[5] & 8) !== 0)), 'chair carry animation flag reaches the other player')
+
 // Legit run through stage 1 -> return pad pays wins.
 const { stageSpawn, stageStartZ, allStages, maxWalkSpeed, WALK_TO_WORLD } = await import('../src/shared/gameData.js')
+// Server-authoritative push: close range, cooldown and immunity, never in a safe room.
+for (const room of [a, b]) room.send('dev', { action: 'tp', stage: 1 })
+await wait(200)
+const pushSpawn = stageSpawn(1)
+for (let i = 1; i <= 6; i++) {
+  a.send('pos', [pushSpawn.x, 1, pushSpawn.z - i * 2, Math.PI, 3])
+  b.send('pos', [pushSpawn.x + 2, 1, pushSpawn.z - i * 2, Math.PI, 3])
+  await wait(180)
+}
+a.send('push', { sid: b.sessionId })
+await wait(200)
+check(lb.push?.length === 1 && lb.push[0].x > 0 && lb.push[0].duration === 0.65, 'E push sends an outward authoritative knockback to the nearby player')
+a.send('push', { sid: b.sessionId })
+await wait(150)
+check(lb.push?.length === 1, 'repeated push is refused during cooldown')
+b.send('dev', { action: 'tp', stage: 2 })
+await wait(150)
+b.send('push', { sid: a.sessionId })
+await wait(150)
+check(!la.push?.length, 'push across stages is refused')
+
 a.send('dev', { action: 'tp', stage: 1 })
 await wait(300)
 const st1 = allStages()[1]
